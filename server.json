@@ -1,0 +1,31 @@
+{
+  "groups": [
+    { "name": "ibank", "members": [
+        {"hostname": "app1", "ip": "127.0.0.1", "port": 22, "user": "cx", "password": "chaxun", "valid": true },
+        {"hostname": "app2", "ip": "127.0.0.1", "port": 22, "user": "cx", "password": "chaxun", "valid": true },
+        {"hostname": "app3", "ip": "127.0.0.1", "port": 22, "user": "cx", "password": "chaxun", "valid": true },
+        {"hostname": "app4", "ip": "127.0.0.1", "port": 22, "user": "cx", "password": "chaxun", "valid": true },
+        {"hostname": "app5", "ip": "127.0.0.1", "port": 22, "user": "cx", "password": "chaxun", "valid": true }
+      ],
+      "valid": true
+    },
+    { "name": "jbank", "members": [
+        {"hostname": "jpp1", "ip": "127.0.0.1", "port": 22, "user": "cx", "password": "chaxun", "valid": true },
+        {"hostname": "jpp2", "ip": "127.0.0.1", "port": 22, "user": "cx", "password": "chaxun", "valid": true },
+        {"hostname": "jpp3", "ip": "127.0.0.1", "port": 22, "user": "cx", "password": "chaxun", "valid": true },
+        {"hostname": "jpp4", "ip": "127.0.0.1", "port": 22, "user": "cx", "password": "chaxun", "valid": true },
+        {"hostname": "jpp5", "ip": "127.0.0.1", "port": 22, "user": "cx", "password": "chaxun", "valid": true }
+      ],
+      "valid": true
+    },
+    { "name": "kbank", "members": [
+        {"hostname": "kpp1", "ip": "127.0.0.1", "port": 22, "user": "cx", "password": "chaxun", "valid": true },
+        {"hostname": "kpp2", "ip": "127.0.0.1", "port": 22, "user": "cx", "password": "chaxun", "valid": true },
+        {"hostname": "kpp3", "ip": "127.0.0.1", "port": 22, "user": "cx", "password": "chaxun", "valid": true },
+        {"hostname": "kpp4", "ip": "127.0.0.1", "port": 22, "user": "cx", "password": "chaxun", "valid": true },
+        {"hostname": "kpp5", "ip": "127.0.0.1", "port": 22, "user": "cx", "password": "chaxun", "valid": true }
+      ],
+      "valid": true
+    }
+  ]
+}
