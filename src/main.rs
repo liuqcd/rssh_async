@@ -19,13 +19,14 @@ use ssh2::Session;
 use tokio::sync::mpsc;
 use tokio_stream::{self as stream, StreamExt};
 use std::io::Read;
-use log::{debug, info, warn, error};
+use log::{trace, debug, info, warn, error};
 use std::time::SystemTime;
 use chrono::offset::Local;
+use tokio::task::JoinSet;
 
 
 /// 利用tokio异步机制，可在一堆远程服务器上执行linux命令，以及上传和下载单个文件。
-/// 所有连接成功后执行命令
+/// 所有连接顺序连接成功后同时执行命令
 #[derive(Parser, Debug)]
 #[command(author="liuqxx", version="0.1.0", long_about = constant::HELP)]
 struct Args {
@@ -38,8 +39,8 @@ struct Args {
     logfile: Option<PathBuf>,
 
     /// 开启DEBUG日志
-    #[arg(short, long, action = ArgAction::SetTrue)]
-    debug: bool,
+    #[arg(short, long, action = ArgAction::Count)]
+    debug: u8,
 
     /// 打印内置配置文件（模板）信息
     #[arg(short, long, action = ArgAction::SetTrue)]
@@ -63,14 +64,14 @@ enum Commands {
     Get {
         /// 要从远程服务器下载文件，只能为单个文件且不能为目录
         source_file: PathBuf,
-        /// 下载文件保存在本地的目录，并重命名文件名格式为: [hostname]_[ip]_[filename]
+        /// 下载文件保存在本地的目录，并重命名文件名格式为: [hostname]_[ip]_[filename], 建议使用相对路径。
         dest_dir: PathBuf,
     },
     /// 上传本地单个文件到远程服务器上
     Put {
         /// 要上传到远程服务器上的文件，只能为单个文件且不能为目录
         source_file: PathBuf,
-        /// 上传到远程服务器上的目录
+        /// 上传到远程服务器上的目录, 要求为相对登录用户HOME目录的路
         dest_dir: PathBuf,
     }
 }
@@ -97,10 +98,10 @@ async fn main() -> Result<()> {
         log.chain(fern::log_file(logfile)?)
     }else { log };
 
-    log = if args.debug {
-        log.level(log::LevelFilter::Debug)
-    }else {
-        log.level(log::LevelFilter::Info)
+    log = match args.debug {
+        0 => log.level(log::LevelFilter::Info),
+        1 => log.level(log::LevelFilter::Debug),
+        _ => log.level(log::LevelFilter::Trace),
     };
 
     log.apply()?;
@@ -143,7 +144,7 @@ async fn main() -> Result<()> {
                         ))?;
 
 
-    let (tx, mut rx) = mpsc::channel(10);
+    let (tx, mut rx) = mpsc::unbounded_channel();
 
     match args.command {
         Some(Commands::Exec {statement}) => {
@@ -154,10 +155,10 @@ async fn main() -> Result<()> {
                 // 执行语句
                 Ok(_) => {
                     if let Err(e) = exec(&mut rx, statement).await {
-                        warn!("{:?}", e);
+                        warn!("执行任务失败: {:?}", e);
                     };
                 },
-                Err(e) => error!("{:?}", e),
+                Err(e) => error!("连接失败: {:?}", e),
             }
         },
         Some(Commands::Put {source_file, dest_dir}) => {
@@ -193,36 +194,37 @@ async fn main() -> Result<()> {
 }
 
 // 连接服务器
-async fn link(vec_regex: Vec<SessionInfo>, tx: mpsc::Sender::<Option<(SessionInfo, Session)>>) -> Result<()> {
-    let mut handles = Vec::new();
+// 不能使用spawn同步连接服务器，连接的个数较多时，大约10几个会报错： [Session(-13)] Failed getting banner
+async fn link(vec_regex: Vec<SessionInfo>, tx: mpsc::UnboundedSender::<Option<(SessionInfo, Session)>>) -> Result<()> {
+
+    let now = Instant::now();
     let mut stream = stream::iter(vec_regex);
+
     while let Some(info) = stream.next().await {
-        let tx1 = tx.clone();
-        let handle = tokio::spawn( async move {
-            link_solo(info, tx1).await
-        });
-        handles.push(handle);
+        let session = link_solo(&info).await?;
+        tx.send(Some((info.clone(), session)))
+            .map_err(|e| attach_info(e.into(), &info))?;
     }
-    for handle in handles {
-        let _ = handle.await??; 
-    }
-    tx.send(None).await?;
+    tx.send(None)?;
+    debug!( "所有连接任务报告完成，elapsed: {}ms", now.elapsed().as_millis());
     Ok(())
 }
 
-async fn link_solo(info: SessionInfo, tx: mpsc::Sender::<Option<(SessionInfo, Session)>>) -> Result<()> {
+async fn link_solo(info: &SessionInfo) -> Result<Session> {
     let now = Instant::now();
     let tcp = time::timeout(Duration::from_secs(3), TcpStream::connect(info.to_socket_addrs())).into_inner().await
                     .map_err(|e| attach_info(e.into(), &info))?;
     let mut session = Session::new()?;
+    session.set_blocking(true);
+    session.set_timeout(5000);
+
     session.set_tcp_stream(tcp);
-    session.handshake()?;
+    session.handshake()
+            .map_err(|e| attach_info(e.into(), &info))?;
     session.userauth_password(&info.user, &info.password)
             .map_err(|e| attach_info(e.into(), &info))?;
     debug!( "{:#}, connect ok, elapsed: {}ms", info.hostname_ip(), now.elapsed().as_millis());
-    tx.send(Some((info.clone(), session))).await
-        .map_err(|e| attach_info(e.into(), &info))?;
-    Ok(())
+    Ok(session)
 }
 
 fn attach_info(e: anyhow::Error, info: &SessionInfo ) -> anyhow::Error {
@@ -238,8 +240,7 @@ fn find_regex_objects(vec: &Vec<SessionInfo>, re: Regex) -> Vec<SessionInfo> {
         .collect()
 }
 
-async fn exec(rx: &mut mpsc::Receiver::<Option<(SessionInfo, Session)>>, statement: Vec<String>) -> Result<()> {
-
+async fn exec(rx: &mut mpsc::UnboundedReceiver::<Option<(SessionInfo, Session)>>, statement: Vec<String>) -> Result<()> {
     let mut command = String::new();
     statement.iter().for_each(|s| {
         command.push_str(s);
@@ -284,24 +285,25 @@ async fn exec_solo(info: SessionInfo, session: Session, command: String) -> Resu
     Ok(())
 }
 
-async fn scp_put(rx: &mut mpsc::Receiver::<Option<(SessionInfo, Session)>>, local_file: PathBuf, remote_file: PathBuf) -> Result<()> {
-    let mut handles = Vec::new();
+async fn scp_put(rx: &mut mpsc::UnboundedReceiver::<Option<(SessionInfo, Session)>>, local_file: PathBuf, remote_file: PathBuf) -> Result<()> {
+    let mut set = JoinSet::new();
     loop {
         let lf = local_file.clone();
         let rf = remote_file.clone();
         if let Some(value) = rx.recv().await {
             if let Some((info, session)) = value {
-                let handle = tokio::spawn(async move {
+                set.spawn(async move {
                     scp_send(info, session, lf, rf).await
                 });
-                handles.push(handle);
             }else {
                 break;
             }
         }
     }
-    for handle in handles {
-        handle.await??;
+    while let Some(res) = set.join_next().await {
+        if let Err(e) = res? {
+            error!("上传文件失败: {}", e);
+        };
     }
     Ok(())
 }
@@ -310,7 +312,10 @@ async fn scp_send(info: SessionInfo, session: Session, local_file: PathBuf, remo
     use std::path::Path;
 
     let now = Instant::now();
+
     let local_path = Path::new(&local_file);
+    trace!("local_path: {:?}, info: {}", local_path, info);
+
     let buf = fs::read(local_path).await
                 .map_err(|e| attach_info(e.into(), &info))?;
 
@@ -318,15 +323,19 @@ async fn scp_send(info: SessionInfo, session: Session, local_file: PathBuf, remo
 
     let local_file_name = local_path.file_name().ok_or(Error::new(ErrorKind::Other, "从localfile中解析filename失败"))
                                     .map_err(|e| attach_info(e.into(), &info))?;
+    trace!("local_file_name: {:?}, info: {}", local_file_name, info);
 
     let mut pathbuf = info.home_buf_path();
     let path = if remote_path.is_absolute() {
+                trace!("remote_path is a absolute path, info: {}", info);
                 remote_path.as_path()
             }else {
-                pathbuf.push(remote_path);
+                trace!("remote_path isn't a absolute path, info: {}", info);
+                pathbuf.push(remote_path.clone());
                 pathbuf.push(local_file_name);
                 pathbuf.as_path()
             };
+    trace!("remote_path: {:?}", remote_path);
 
     let mut remote_file = session.scp_send(path, 0o644, len as u64, None)
                         .map_err(|e| attach_info(e.into(), &info))?;
@@ -343,24 +352,25 @@ async fn scp_send(info: SessionInfo, session: Session, local_file: PathBuf, remo
     Ok(())
 }
 
-pub async fn scp_get(rx: &mut mpsc::Receiver::<Option<(SessionInfo, Session)>>, remote_file: PathBuf, local_path: PathBuf) -> Result<()> {
-    let mut handles = Vec::new();
+pub async fn scp_get(rx: &mut mpsc::UnboundedReceiver::<Option<(SessionInfo, Session)>>, remote_file: PathBuf, local_path: PathBuf) -> Result<()> {
+    let mut set = JoinSet::new();
     loop {
         let rf = remote_file.clone();
         let lp = local_path.clone();
         if let Some(value) = rx.recv().await {
             if let Some((info, session)) = value {
-                let handle = tokio::spawn(async move {
+                set.spawn(async move {
                     scp_recv(info, session, rf, lp).await
                 });
-                handles.push(handle);
             }else {
                 break;
             }
         }
     }
-    for handle in handles {
-        handle.await??;
+    while let Some(res) = set.join_next().await {
+        if let Err(e) = res? {
+            error!("下载文件失败: {}", e);
+        };
     }
     Ok(())
 }
